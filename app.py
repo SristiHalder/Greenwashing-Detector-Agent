@@ -11,6 +11,7 @@ except ImportError:
 from agent import db
 from agent.pipeline import run_full_pipeline
 from agent.explain_agent import answer_question
+from agent.company_validator import company_validator  # ✅ NEW
 
 # ─────────────────────────────────────────────────────────────
 # Page config
@@ -150,7 +151,7 @@ def show_results(company, score_data, report_text, ai_chunks):
         else:
             st.warning("No report available.")
 
-    # ---------------- Metrics (FIXED CLEAN) ----------------
+    # ---------------- Metrics ----------------
     with tab2:
         metrics = score_data.get("metrics", {})
 
@@ -239,15 +240,25 @@ def run_with_progress(company):
 # Main logic
 # ─────────────────────────────────────────────────────────────
 
-if analyze_btn:
-    st.session_state.pop("results", None)
-
-active_company = None
-
 if analyze_btn and company_input:
     active_company = company_input.strip()
+
+    # ✅ VALIDATION STEP
+    validation = company_validator(active_company)
+
+    if validation["status"] == "invalid":
+        st.error(f"❌ {validation['reason']}")
+        st.stop()
+
+    elif validation["status"] == "ambiguous":
+        st.warning(f"⚠️ {validation['reason']}")
+        st.info("Try a more specific name (e.g. 'Apple Inc' instead of 'Apple')")
+        st.stop()
+
 elif "selected_company" in st.session_state:
     active_company = st.session_state["selected_company"]
+else:
+    active_company = None
 
 if not active_company:
     st.info("Enter a company name and click Analyze")
