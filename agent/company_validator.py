@@ -7,23 +7,15 @@ from agent.tavily_client import tavily_search
 
 
 TRUSTED_DOMAINS = [
-    "wikipedia.org",
-    "bloomberg.com",
-    "reuters.com",
-    "sec.gov",
-    "linkedin.com",
-    "forbes.com",
-    "ft.com",
-    "nytimes.com",
-    "yahoo.com",
-    "finance.yahoo.com",
-    "britannica.com"
+    "wikipedia.org", "bloomberg.com", "reuters.com", "sec.gov",
+    "linkedin.com", "forbes.com", "ft.com", "nytimes.com",
+    "yahoo.com", "finance.yahoo.com", "britannica.com"
 ]
 
 COMPANY_INDICATORS = ["inc", "ltd", "corp", "company", "plc", "holdings", "group", "ag", "sa", "gmbh"]
 
-MIN_CONFIDENCE_VALID = 0.35
-MIN_RESULTS_REQUIRED = 5
+MIN_CONFIDENCE_VALID = 0.25
+MIN_RESULTS_REQUIRED = 3
 
 
 def normalize(text):
@@ -36,56 +28,6 @@ def extract_root_domain(url):
         return parsed.netloc.replace("www.", "")
     except Exception:
         return ""
-
-
-def is_company_wikipedia_page(url, title, company_lower):
-    url = url.lower()
-    title = title.lower()
-
-    if "wikipedia.org/wiki/" not in url:
-        return False
-
-    # URL must contain company name (spaces → underscores in Wikipedia URLs)
-    company_slug = company_lower.replace(" ", "_")
-    if company_slug not in url:
-        return False
-
-    # Title must indicate a company-like entity
-    if any(ind in title for ind in COMPANY_INDICATORS):
-        return True
-
-    if company_lower in title:
-        return True
-
-    return False
-
-
-def find_official_domain(company_lower, domain_counts):
-    """
-    Try to find a domain that plausibly belongs to the company.
-
-    Strategy: check ALL words in the company name (not just the first word),
-    preferring longer matches to avoid false positives like 'general' matching
-    'general-store.com'.
-    """
-
-    words = [w for w in company_lower.split() if len(w) > 3]  # skip short words
-
-    # Score each domain by how many company words it contains
-    best_domain = None
-    best_score = 0
-
-    for domain in domain_counts:
-        score = sum(1 for w in words if w in domain)
-        if score > best_score:
-            best_score = score
-            best_domain = domain
-
-    # Fall back to most common domain if no word match found
-    if not best_domain and domain_counts:
-        best_domain = domain_counts.most_common(1)[0][0]
-
-    return best_domain
 
 
 def company_validator(company):
@@ -103,19 +45,29 @@ def company_validator(company):
 
     company_lower = normalize(company)
 
+    # FIX: fallback if input is too short or weird
+    if not company_lower or len(company_lower) < 2:
+        return {
+            "status": "invalid",
+            "confidence": 0.0,
+            "reason": "Please enter a valid company name.",
+            "official_domain": None
+        }
+
+    company_words = [w for w in company_lower.split() if len(w) > 2]
+
+    # TOO FEW RESULTS
     if len(results) < MIN_RESULTS_REQUIRED:
         return {
             "status": "invalid",
             "confidence": 0.0,
-            "reason": "Insufficient search results.",
-            "official_domain": None,
-            "evidence": {"total_results": len(results)}
+            "reason": "Not enough information found. Try a more specific company name.",
+            "official_domain": None
         }
 
     match_count = 0
     trusted_count = 0
     domains = []
-    has_strong_wiki = False
 
     for r in results:
         title = normalize(r.get("title", ""))
@@ -126,18 +78,18 @@ def company_validator(company):
         if root_domain:
             domains.append(root_domain)
 
-        if company_lower in title or company_lower in content:
+        # IMPROVED MATCHING
+        if (
+            any(word in title or word in content for word in company_words)
+            or company_lower in title
+        ):
             match_count += 1
 
         if root_domain in TRUSTED_DOMAINS:
             trusted_count += 1
 
-        if is_company_wikipedia_page(url, title, company_lower):
-            has_strong_wiki = True
-
     match_ratio = match_count / len(results)
     trusted_ratio = trusted_count / len(results)
-    wiki_bonus = 0.1 if has_strong_wiki else 0.0  # Wikipedia presence is a real signal
 
     domain_counts = Counter(domains)
 
@@ -148,90 +100,38 @@ def company_validator(company):
         top_domain = None
         top_domain_share = 0
 
-    # Confidence now includes Wikipedia bonus
-    confidence = round(
-        (0.55 * match_ratio) + (0.35 * trusted_ratio) + wiki_bonus,
-        2
-    )
-    confidence = min(confidence, 1.0)  # cap at 1.0
-
     unique_domain_count = len(domain_counts)
 
-    # --------------------------------------------------
-    # STRONG GLOBAL BRAND OVERRIDE
-    # --------------------------------------------------
+    confidence = round(
+        (0.6 * match_ratio) + (0.4 * trusted_ratio),
+        2
+    )
 
-    if match_ratio >= 0.6 and (trusted_ratio >= 0.3 or has_strong_wiki):
-        official_domain = find_official_domain(company_lower, domain_counts)
-
-        return {
-            "status": "valid",
-            "confidence": confidence,
-            "reason": "Strong global brand identity detected.",
-            "official_domain": official_domain,
-            "evidence": {
-                "match_ratio": round(match_ratio, 2),
-                "trusted_ratio": round(trusted_ratio, 2),
-                "has_wikipedia": has_strong_wiki,
-                "top_domain_share": round(top_domain_share, 2)
-            }
-        }
-
-    # --------------------------------------------------
-    # AMBIGUITY DETECTION
-    # Trigger for short names (1–2 words) with fragmented domain spread.
-    # Multi-word names can be equally ambiguous (e.g. "General Electric").
-    # --------------------------------------------------
-
+    # AMBIGUOUS
     if (
-        len(company.split()) <= 2
-        and unique_domain_count >= 4
-        and top_domain_share < 0.35
+        len(company_words) <= 2
+        and unique_domain_count >= 6
+        and top_domain_share < 0.25
+        and match_ratio < 0.6 
     ):
         return {
             "status": "ambiguous",
             "confidence": confidence,
-            "reason": "Multiple distinct domains detected — name may be ambiguous.",
-            "official_domain": None,
-            "evidence": {
-                "unique_domains": unique_domain_count,
-                "top_domain_share": round(top_domain_share, 2),
-                "domains": list(domain_counts.keys())[:5]
-            }
+            "reason": "This name is too broad or ambiguous. Try a more specific company name."
         }
 
-    # --------------------------------------------------
     # INVALID
-    # --------------------------------------------------
-
     if confidence < MIN_CONFIDENCE_VALID:
         return {
             "status": "invalid",
             "confidence": confidence,
-            "reason": "Low identity confidence.",
-            "official_domain": None,
-            "evidence": {
-                "match_ratio": round(match_ratio, 2),
-                "trusted_ratio": round(trusted_ratio, 2),
-                "has_wikipedia": has_strong_wiki
-            }
+            "reason": "Could not confidently identify a company. Try a clearer or full company name."
         }
 
-    # --------------------------------------------------
-    # DEFAULT VALID
-    # --------------------------------------------------
-
-    official_domain = find_official_domain(company_lower, domain_counts)
-
+    #  VALID
     return {
         "status": "valid",
         "confidence": confidence,
-        "reason": "Company appears legitimate.",
-        "official_domain": official_domain,
-        "evidence": {
-            "match_ratio": round(match_ratio, 2),
-            "trusted_ratio": round(trusted_ratio, 2),
-            "has_wikipedia": has_strong_wiki,
-            "top_domain_share": round(top_domain_share, 2)
-        }
+        "reason": "Company appears valid.",
+        "official_domain": top_domain
     }
